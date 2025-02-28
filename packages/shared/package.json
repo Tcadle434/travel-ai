@@ -1,0 +1,22 @@
+{
+	"name": "@travel-ai/shared",
+	"version": "1.0.0",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1",
+		"dev": "tsc --watch",
+		"build": "tsc",
+		"clean": "rimraf dist"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"description": "",
+	"devDependencies": {
+		"@types/node": "^22.13.5",
+		"rimraf": "^5.0.1",
+		"typescript": "^5.7.3",
+		"@repo/typescript-config": "workspace:*"
+	}
+}
