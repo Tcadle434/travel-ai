@@ -7,6 +7,7 @@ import {
   Conversation,
   ConversationSchema,
 } from './schemas/conversation.schema';
+import { RedisModule } from '../redis/redis.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import {
       { name: Message.name, schema: MessageSchema },
       { name: Conversation.name, schema: ConversationSchema },
     ]),
+    RedisModule,
   ],
   controllers: [ConversationController],
   providers: [ConversationService],

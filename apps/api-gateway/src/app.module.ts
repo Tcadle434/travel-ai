@@ -6,6 +6,7 @@ import { AppService } from './app.service';
 import { RabbitmqModule } from './rabbitmq/rabbitmq.module';
 import { WebsocketModule } from './websocket/websocket.module';
 import { ConversationModule } from './conversation/conversation.module';
+import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { ConversationModule } from './conversation/conversation.module';
     RabbitmqModule,
     WebsocketModule,
     ConversationModule,
+    RedisModule,
   ],
   controllers: [AppController],
   providers: [AppService],

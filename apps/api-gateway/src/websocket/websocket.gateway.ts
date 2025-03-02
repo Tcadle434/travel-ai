@@ -13,6 +13,8 @@ import { Server, Socket } from 'socket.io';
 import { Logger } from '@nestjs/common';
 import { RabbitmqService } from '../rabbitmq/rabbitmq.service';
 import { QUEUE_CONFIG, QueueMessage, generateId } from '@travel-ai/shared';
+import { RedisService } from '../redis/redis.service';
+import { RedisCacheService } from '../redis/redis-cache.service';
 
 @WebSocketGateway({
   cors: {
@@ -25,9 +27,15 @@ export class WebsocketGateway
 {
   @WebSocketServer() server: Server;
   private logger = new Logger('WebsocketGateway');
-  private userSockets: Map<string, string> = new Map(); // userId -> socketId
+  private readonly USER_SOCKET_PREFIX = 'socket:user:';
+  private readonly SOCKET_USER_PREFIX = 'socket:id:';
+  private readonly SOCKET_TTL = 86400; // 1 day in seconds
 
-  constructor(private readonly rabbitmqService: RabbitmqService) {}
+  constructor(
+    private readonly rabbitmqService: RabbitmqService,
+    private readonly redisService: RedisService,
+    private readonly cacheService: RedisCacheService,
+  ) {}
 
   afterInit(server: Server) {
     this.logger.log('WebSocket Gateway initialized');
@@ -38,31 +46,64 @@ export class WebsocketGateway
     }, 1000);
   }
 
-  handleConnection(client: Socket) {
+  async handleConnection(client: Socket) {
     this.logger.log(`Client connected: ${client.id}`);
   }
 
-  handleDisconnect(client: Socket) {
+  async handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
-    // Remove user from userSockets map
-    for (const [userId, socketId] of this.userSockets.entries()) {
-      if (socketId === client.id) {
-        this.userSockets.delete(userId);
-        break;
+
+    try {
+      // Get userId from Redis
+      const userId = await this.redisService.get(
+        `${this.SOCKET_USER_PREFIX}${client.id}`,
+      );
+
+      if (userId) {
+        // Remove user-socket mapping from Redis
+        await this.redisService.del(`${this.USER_SOCKET_PREFIX}${userId}`);
+        await this.redisService.del(`${this.SOCKET_USER_PREFIX}${client.id}`);
+        this.logger.log(`User mapping removed for socket: ${client.id}`);
       }
+    } catch (error) {
+      this.logger.error(
+        `Error removing socket mapping: ${error.message}`,
+        error.stack,
+      );
     }
   }
 
   @SubscribeMessage('identify')
-  handleIdentify(
+  async handleIdentify(
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { userId: string },
   ) {
     const { userId } = data;
     if (userId) {
-      this.userSockets.set(userId, client.id);
-      this.logger.log(`User ${userId} identified with socket ${client.id}`);
-      return { success: true };
+      try {
+        // Store user-socket mapping in Redis
+        await this.redisService.set(
+          `${this.USER_SOCKET_PREFIX}${userId}`,
+          client.id,
+          this.SOCKET_TTL,
+        );
+
+        // Store socket-user mapping for reverse lookup
+        await this.redisService.set(
+          `${this.SOCKET_USER_PREFIX}${client.id}`,
+          userId,
+          this.SOCKET_TTL,
+        );
+
+        this.logger.log(`User ${userId} identified with socket ${client.id}`);
+        return { success: true };
+      } catch (error) {
+        this.logger.error(
+          `Error identifying user: ${error.message}`,
+          error.stack,
+        );
+        return { success: false, error: 'Failed to identify user' };
+      }
     }
     return { success: false, error: 'No userId provided' };
   }
@@ -99,6 +140,9 @@ export class WebsocketGateway
       // In a production system, we might use a request-response pattern here
       await new Promise((resolve) => setTimeout(resolve, 300));
 
+      // Invalidate user conversations cache
+      await this.cacheService.invalidateUserConversationsCache(userId);
+
       return {
         success: true,
         conversationId,
@@ -107,59 +151,6 @@ export class WebsocketGateway
     } catch (error) {
       this.logger.error('Error creating conversation', error);
       return { success: false, error: 'Failed to create conversation' };
-    }
-  }
-
-  @SubscribeMessage('get_conversations')
-  async handleGetConversations(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { userId: string },
-  ) {
-    try {
-      const { userId } = data;
-
-      // Create a unique request ID for this query
-      const requestId = generateId();
-
-      // Set up a promise to wait for the response
-      const responsePromise = new Promise((resolve, reject) => {
-        // Set a timeout for the response
-        const timeout = setTimeout(() => {
-          reject(new Error('Request timed out'));
-          this.responseHandlers.delete(requestId);
-        }, 15000);
-
-        // Store the handler
-        this.responseHandlers.set(requestId, (data: any) => {
-          clearTimeout(timeout);
-          resolve(data);
-          this.responseHandlers.delete(requestId);
-        });
-      });
-
-      // Publish the request
-      await this.rabbitmqService.publishMessage(
-        QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_LISTED,
-        {
-          id: requestId,
-          type: 'GET_CONVERSATIONS',
-          payload: {
-            userId,
-            requestId,
-          },
-          timestamp: new Date(),
-        },
-      );
-
-      // Wait for the response
-      const conversationsData = await responsePromise;
-      return {
-        success: true,
-        conversations: conversationsData,
-      };
-    } catch (error) {
-      this.logger.error('Error getting conversations', error);
-      return { success: false, error: 'Failed to get conversations' };
     }
   }
 
@@ -192,6 +183,12 @@ export class WebsocketGateway
         },
       );
 
+      // Invalidate conversation cache
+      await this.cacheService.invalidateConversationCache(conversationId);
+
+      // Invalidate user conversations cache
+      await this.cacheService.invalidateUserConversationsCache(userId);
+
       return {
         success: true,
         messageId,
@@ -202,17 +199,68 @@ export class WebsocketGateway
     }
   }
 
-  // Map to store response handlers by requestId
-  private responseHandlers = new Map<string, (data: any) => void>();
+  @SubscribeMessage('typing')
+  async handleTyping(
+    @ConnectedSocket() client: Socket,
+    @MessageBody()
+    data: { userId: string; conversationId: string; isTyping: boolean },
+  ) {
+    try {
+      const { userId, conversationId, isTyping } = data;
+
+      if (isTyping) {
+        // Set typing indicator in Redis
+        await this.cacheService.setTypingIndicator(conversationId, userId);
+
+        // Broadcast typing event to other users in the conversation
+        // In a real app, we would determine who else is in the conversation
+        // For now, we broadcast to all clients except the sender
+        client.broadcast.emit('typing_indicator', {
+          conversationId,
+          userId,
+          isTyping: true,
+        });
+      } else {
+        // Remove typing indicator
+        await this.redisService.del(`typing:${conversationId}`);
+
+        // Broadcast typing stopped event
+        client.broadcast.emit('typing_indicator', {
+          conversationId,
+          userId,
+          isTyping: false,
+        });
+      }
+
+      return { success: true };
+    } catch (error) {
+      this.logger.error('Error handling typing indicator', error);
+      return { success: false, error: 'Failed to update typing status' };
+    }
+  }
 
   // Method to send a message to a specific user
-  sendToUser(userId: string, event: string, data: any) {
-    const socketId = this.userSockets.get(userId);
-    if (socketId) {
-      this.server.to(socketId).emit(event, data);
-      return true;
+  async sendToUser(userId: string, event: string, data: any) {
+    try {
+      // Get socket ID from Redis
+      const socketId = await this.redisService.get(
+        `${this.USER_SOCKET_PREFIX}${userId}`,
+      );
+
+      if (socketId) {
+        this.server.to(socketId).emit(event, data);
+        return true;
+      }
+
+      this.logger.warn(`No socket found for user: ${userId}`);
+      return false;
+    } catch (error) {
+      this.logger.error(
+        `Error sending to user ${userId}: ${error.message}`,
+        error.stack,
+      );
+      return false;
     }
-    return false;
   }
 
   // Consume notification messages from RabbitMQ
@@ -229,7 +277,7 @@ export class WebsocketGateway
           switch (message.type) {
             case 'CONVERSATION_UPDATED':
               if (payload.userId && payload.assistantMessage) {
-                this.sendToUser(
+                await this.sendToUser(
                   payload.userId,
                   'message_received',
                   payload.assistantMessage,
@@ -237,24 +285,9 @@ export class WebsocketGateway
               }
               break;
 
-            case 'CONVERSATION_RESPONSE':
-            case 'GET_CONVERSATIONS':
-            case 'CONVERSATION_LISTED':
-              // This is a response to a specific request
-              if (
-                payload.requestId &&
-                this.responseHandlers.has(payload.requestId)
-              ) {
-                const handler = this.responseHandlers.get(payload.requestId);
-                if (handler) {
-                  handler(payload.data);
-                }
-              }
-              break;
-
             case 'ITINERARY_GENERATED':
               if (payload.userId) {
-                this.sendToUser(
+                await this.sendToUser(
                   payload.userId,
                   'itinerary_generated',
                   payload.itinerary,
