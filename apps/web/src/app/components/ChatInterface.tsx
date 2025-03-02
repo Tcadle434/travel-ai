@@ -25,6 +25,7 @@ export default function ChatInterface() {
 	const [sidebarOpen, setSidebarOpen] = useState(true);
 	const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	const [receivedMessageIds, setReceivedMessageIds] = useState<Set<string>>(new Set());
 
 	// Initialize socket connection
 	useEffect(() => {
@@ -61,6 +62,18 @@ export default function ChatInterface() {
 
 		newSocket.on("message_received", (data: any) => {
 			console.log("Message received:", data);
+
+			// Check for duplicate messages
+			if (data.id && receivedMessageIds.has(data.id)) {
+				console.warn(`Duplicate message received and ignored: ${data.id}`);
+				return;
+			}
+
+			// Add message ID to the set of received messages
+			if (data.id) {
+				setReceivedMessageIds((prev) => new Set(prev).add(data.id));
+			}
+
 			setMessages((prev) => [
 				...prev,
 				{
@@ -84,7 +97,14 @@ export default function ChatInterface() {
 		return () => {
 			newSocket.disconnect();
 		};
-	}, []);
+	}, [receivedMessageIds]);
+
+	// Reset received message IDs when switching conversations
+	useEffect(() => {
+		if (activeConversationId) {
+			setReceivedMessageIds(new Set());
+		}
+	}, [activeConversationId]);
 
 	// Fetch user conversations using HTTP
 	const fetchUserConversations = async () => {

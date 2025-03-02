@@ -30,6 +30,8 @@ export class WebsocketGateway
   private readonly USER_SOCKET_PREFIX = 'socket:user:';
   private readonly SOCKET_USER_PREFIX = 'socket:id:';
   private readonly SOCKET_TTL = 86400; // 1 day in seconds
+  private readonly SENT_MESSAGE_PREFIX = 'sent:message:';
+  private readonly SENT_MESSAGE_TTL = 60; // 1 minute in seconds
 
   constructor(
     private readonly rabbitmqService: RabbitmqService,
@@ -242,6 +244,20 @@ export class WebsocketGateway
   // Method to send a message to a specific user
   async sendToUser(userId: string, event: string, data: any) {
     try {
+      // Check if this message has already been sent (deduplication)
+      if (data.id) {
+        const messageKey = `${this.SENT_MESSAGE_PREFIX}${userId}:${data.id}`;
+        const alreadySent = await this.redisService.exists(messageKey);
+
+        if (alreadySent) {
+          this.logger.warn(`Duplicate message detected, skipping: ${data.id}`);
+          return false;
+        }
+
+        // Mark this message as sent
+        await this.redisService.set(messageKey, 'sent', this.SENT_MESSAGE_TTL);
+      }
+
       // Get socket ID from Redis
       const socketId = await this.redisService.get(
         `${this.USER_SOCKET_PREFIX}${userId}`,
@@ -249,6 +265,7 @@ export class WebsocketGateway
 
       if (socketId) {
         this.server.to(socketId).emit(event, data);
+        this.logger.debug(`Sent ${event} to user ${userId}`);
         return true;
       }
 
