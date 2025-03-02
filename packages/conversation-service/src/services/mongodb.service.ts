@@ -62,6 +62,7 @@ export class MongoDBService {
 	}
 
 	async getConversationMessages(conversationId: string): Promise<any[]> {
+		console.log("getConversationMessages", conversationId);
 		return this.messages.find({ conversationId }).sort({ timestamp: 1 }).toArray();
 	}
 }

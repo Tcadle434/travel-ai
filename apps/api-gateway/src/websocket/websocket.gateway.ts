@@ -16,7 +16,7 @@ import { QUEUE_CONFIG, QueueMessage, generateId } from '@travel-ai/shared';
 
 @WebSocketGateway({
   cors: {
-    origin: ['http://localhost:3000'], // Allow your Next.js app
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
     credentials: true,
   },
 })
@@ -26,8 +26,6 @@ export class WebsocketGateway
   @WebSocketServer() server: Server;
   private logger = new Logger('WebsocketGateway');
   private userSockets: Map<string, string> = new Map(); // userId -> socketId
-  // Map to store response handlers by requestId
-  private responseHandlers = new Map<string, (data: any) => void>();
 
   constructor(private readonly rabbitmqService: RabbitmqService) {}
 
@@ -69,60 +67,6 @@ export class WebsocketGateway
     return { success: false, error: 'No userId provided' };
   }
 
-  @SubscribeMessage('send_message')
-  async handleSendMessage(
-    @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: {
-      conversationId: string;
-      userId: string;
-      content: string;
-    },
-  ) {
-    try {
-      const { conversationId, userId, content } = data;
-
-      // Create a new message
-      const message = {
-        id: generateId(),
-        conversationId,
-        content,
-        timestamp: new Date(),
-      };
-
-      // Publish message to conversation queue
-      await this.rabbitmqService.publishMessage(
-        QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_UPDATED,
-        {
-          id: generateId(),
-          type: 'CONVERSATION_UPDATED',
-          payload: {
-            conversationId,
-            userId,
-            message,
-          },
-          timestamp: new Date(),
-        },
-      );
-
-      // Return success to client
-      return {
-        success: true,
-        message,
-      };
-    } catch (error) {
-      this.logger.error('Error sending message', error);
-      return {
-        success: false,
-        error: 'Failed to send message',
-      };
-    }
-  }
-
-  // In apps/api-gateway/src/websocket/websocket.gateway.ts
-
-  // Add these handlers to your existing gateway
-
   @SubscribeMessage('create_conversation')
   async handleCreateConversation(
     @ConnectedSocket() client: Socket,
@@ -151,14 +95,14 @@ export class WebsocketGateway
         },
       );
 
+      // Wait for conversation to be created
+      // In a production system, we might use a request-response pattern here
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
       return {
         success: true,
-        conversation: {
-          id: conversationId,
-          title: conversationTitle,
-          lastMessage: '',
-          timestamp: new Date(),
-        },
+        conversationId,
+        title: conversationTitle,
       };
     } catch (error) {
       this.logger.error('Error creating conversation', error);
@@ -174,28 +118,44 @@ export class WebsocketGateway
     try {
       const { userId } = data;
 
-      // Instead of direct Redis call, we'll publish to queue and await response
-      // For now, we'll mock this with a direct response
-      // In a real implementation, you'd wait for response from the conversation service
+      // Create a unique request ID for this query
+      const requestId = generateId();
 
-      // Sample response
+      // Set up a promise to wait for the response
+      const responsePromise = new Promise((resolve, reject) => {
+        // Set a timeout for the response
+        const timeout = setTimeout(() => {
+          reject(new Error('Request timed out'));
+          this.responseHandlers.delete(requestId);
+        }, 15000);
+
+        // Store the handler
+        this.responseHandlers.set(requestId, (data: any) => {
+          clearTimeout(timeout);
+          resolve(data);
+          this.responseHandlers.delete(requestId);
+        });
+      });
+
+      // Publish the request
+      await this.rabbitmqService.publishMessage(
+        QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_LISTED,
+        {
+          id: requestId,
+          type: 'GET_CONVERSATIONS',
+          payload: {
+            userId,
+            requestId,
+          },
+          timestamp: new Date(),
+        },
+      );
+
+      // Wait for the response
+      const conversationsData = await responsePromise;
       return {
         success: true,
-        conversations: [
-          // These would come from the database in a real implementation
-          {
-            id: generateId(),
-            title: 'Trip to Japan',
-            lastMessage: 'When is the best time to visit Tokyo?',
-            timestamp: new Date(Date.now() - 86400000),
-          },
-          {
-            id: generateId(),
-            title: 'European Vacation',
-            lastMessage: 'I would recommend visiting Italy in May.',
-            timestamp: new Date(Date.now() - 172800000),
-          },
-        ],
+        conversations: conversationsData,
       };
     } catch (error) {
       this.logger.error('Error getting conversations', error);
@@ -203,26 +163,47 @@ export class WebsocketGateway
     }
   }
 
-  @SubscribeMessage('switch_conversation')
-  async handleSwitchConversation(
+  @SubscribeMessage('send_message')
+  async handleSendMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { userId: string; conversationId: string },
+    @MessageBody()
+    data: { userId: string; conversationId: string; message: string },
   ) {
     try {
-      const { userId, conversationId } = data;
+      const { userId, conversationId, message } = data;
+      const messageId = generateId();
 
-      // Here you'd typically fetch the conversation history from your database
-      // For now, we'll just confirm the switch was received
+      // Publish to queue
+      await this.rabbitmqService.publishMessage(
+        QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_UPDATED,
+        {
+          id: generateId(),
+          type: 'CONVERSATION_UPDATED',
+          payload: {
+            conversationId,
+            userId,
+            message: {
+              id: messageId,
+              content: message,
+              timestamp: new Date(),
+            },
+          },
+          timestamp: new Date(),
+        },
+      );
 
       return {
         success: true,
-        conversationId,
+        messageId,
       };
     } catch (error) {
-      this.logger.error('Error switching conversation', error);
-      return { success: false, error: 'Failed to switch conversation' };
+      this.logger.error('Error sending message', error);
+      return { success: false, error: 'Failed to send message' };
     }
   }
+
+  // Map to store response handlers by requestId
+  private responseHandlers = new Map<string, (data: any) => void>();
 
   // Method to send a message to a specific user
   sendToUser(userId: string, event: string, data: any) {
@@ -256,19 +237,17 @@ export class WebsocketGateway
               }
               break;
 
+            case 'CONVERSATION_RESPONSE':
             case 'GET_CONVERSATIONS':
-            case 'CONVERSATION_TITLE_UPDATED':
-            case 'CONVERSATION_CREATED':
             case 'CONVERSATION_LISTED':
-            case 'CONVERSATION_SWITCHED':
-            case 'CONVERSATION_MESSAGES':
+              // This is a response to a specific request
               if (
                 payload.requestId &&
                 this.responseHandlers.has(payload.requestId)
               ) {
                 const handler = this.responseHandlers.get(payload.requestId);
                 if (handler) {
-                  handler(payload.data || payload);
+                  handler(payload.data);
                 }
               }
               break;

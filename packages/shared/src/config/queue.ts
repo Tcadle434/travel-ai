@@ -14,31 +14,15 @@ export const QUEUE_CONFIG = {
 		TRAVEL: "travel-exchange",
 	},
 
-	// Routing keys - Standardized across all services
+	// Routing keys
 	ROUTING_KEYS: {
 		CONVERSATION_UPDATED: "conversation.updated",
 		CONVERSATION_CREATED: "conversation.created",
 		CONVERSATION_LISTED: "conversation.listed",
 		CONVERSATION_MESSAGES: "conversation.messages",
-		CONVERSATION_TITLE_UPDATED: "conversation.title.updated",
-		CONVERSATION_SWITCHED: "conversation.switched",
-		NOTIFICATION: "notification",
+		CONVERSATION_RESPONSE: "conversation.response",
 		GENERATE_ITINERARY: "itinerary.generate",
 		ITINERARY_GENERATED: "itinerary.generated",
+		ERROR: "error",
 	},
 };
-
-// Standardized message types
-export type MessageType =
-	| "CONVERSATION_UPDATED"
-	| "CONVERSATION_CREATED"
-	| "GET_CONVERSATIONS"
-	| "CONVERSATION_LISTED"
-	| "SWITCH_CONVERSATION"
-	| "CONVERSATION_SWITCHED"
-	| "UPDATE_CONVERSATION_TITLE"
-	| "CONVERSATION_TITLE_UPDATED"
-	| "GET_CONVERSATION_MESSAGES"
-	| "CONVERSATION_MESSAGES"
-	| "GENERATE_ITINERARY"
-	| "ITINERARY_GENERATED";

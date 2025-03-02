@@ -6,6 +6,9 @@ import { io, Socket } from "socket.io-client";
 // Mock user ID for demo purposes
 const MOCK_USER_ID = "user-" + Math.random().toString(36).substring(2, 9);
 
+// API base URL
+const API_BASE_URL = "http://localhost:4000/api";
+
 interface Message {
 	id: string;
 	content: string;
@@ -87,88 +90,133 @@ export default function ChatInterface() {
 		};
 	}, []);
 
+	// Fetch user conversations using HTTP
+	const fetchUserConversations = async () => {
+		try {
+			const response = await fetch(`${API_BASE_URL}/conversations?userId=${MOCK_USER_ID}`);
+			const data = await response.json();
+
+			console.log("Fetch conversations response:", data);
+
+			if (data.success && data.conversations) {
+				setConversationHistory(data.conversations);
+
+				// If we have conversations and no active one, set the first as active
+				if (data.conversations.length > 0 && !activeConversationId) {
+					setActiveConversationId(data.conversations[0].id);
+					fetchConversationMessages(data.conversations[0].id);
+				}
+			}
+		} catch (error) {
+			console.error("Error fetching user conversations:", error);
+		}
+	};
+
+	// Fetch conversation messages using HTTP
+	const fetchConversationMessages = async (conversationId: string) => {
+		try {
+			const response = await fetch(
+				`${API_BASE_URL}/conversations/${conversationId}/messages`
+			);
+			const data = await response.json();
+
+			console.log("Fetch messages response:", data);
+
+			if (data.success && data.messages) {
+				// Format and set messages from history
+				const formattedMessages = data.messages.map((msg: any) => ({
+					id: msg.id,
+					content: msg.content,
+					isUser: msg.role === "user",
+					timestamp: new Date(msg.timestamp),
+				}));
+
+				// Sort messages by timestamp to ensure proper conversation flow
+				formattedMessages.sort(
+					(a: Message, b: Message) => a.timestamp.getTime() - b.timestamp.getTime()
+				);
+
+				setMessages(formattedMessages);
+			} else {
+				console.error("Failed to fetch conversation messages:", data.error);
+				setMessages([]);
+			}
+		} catch (error) {
+			console.error("Error fetching conversation messages:", error);
+			setMessages([]);
+		}
+	};
+
 	// Load user conversations when connected
 	useEffect(() => {
-		if (socket && connected) {
-			// Get all user conversations
-			socket.emit("get_conversations", { userId: MOCK_USER_ID }, (response: any) => {
-				console.log("Get conversations response:", response);
-				if (response.success && response.conversations) {
-					setConversationHistory(response.conversations);
-
-					// If we have conversations and no active one, set the first as active
-					if (response.conversations.length > 0 && !activeConversationId) {
-						handleSwitchConversation(response.conversations[0].id);
-					}
-				}
-			});
+		if (connected) {
+			fetchUserConversations();
 		}
-	}, [socket, connected, activeConversationId]);
+	}, [connected]);
 
-	// Auto-scroll to bottom when messages change
+	// Scroll to bottom when messages change
 	useEffect(() => {
 		messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
 	}, [messages]);
 
 	// Handle sending a message
-	const handleSendMessage = (e: React.FormEvent) => {
-		e.preventDefault();
+	const handleSendMessage = () => {
+		if (!socket || !connected || !input.trim() || !activeConversationId) return;
 
-		if (!input.trim() || !socket || !connected || !activeConversationId) return;
+		// Create a temporary message ID
+		const tempId = "temp-" + Date.now();
 
-		const message = {
+		// Add user message to the UI immediately
+		const userMessage = {
+			id: tempId,
 			content: input,
-			conversationId: activeConversationId,
-			userId: MOCK_USER_ID,
+			isUser: true,
+			timestamp: new Date(),
 		};
 
-		// Set typing before sending the message
+		setMessages((prev) => [...prev, userMessage]);
+		setInput("");
 		setTyping(true);
 
-		socket.emit("send_message", message, (response: any) => {
-			console.log("Send message response:", response);
-			if (!response.success) {
-				console.error("Failed to send message:", response);
-				// If sending fails, turn off typing indicator
-				setTyping(false);
+		// Send message to server
+		socket.emit(
+			"send_message",
+			{ userId: MOCK_USER_ID, conversationId: activeConversationId, message: input },
+			(response: any) => {
+				console.log("Send message response:", response);
+				if (!response.success) {
+					console.error("Failed to send message:", response.error);
+				}
 			}
-		});
+		);
+	};
 
-		// Add the message to the UI immediately
-		setMessages((prev) => [
-			...prev,
-			{
-				id: Date.now().toString(),
-				content: input,
-				isUser: true,
-				timestamp: new Date(),
-			},
-		]);
-
-		setInput("");
+	// Handle suggested input
+	const setSuggestedInput = (text: string) => {
+		setInput(text);
 	};
 
 	// Create a new conversation
-	const handleNewConversation = () => {
+	const handleCreateConversation = () => {
 		if (!socket || !connected) return;
-
-		setTyping(false);
-		setMessages([]);
 
 		socket.emit(
 			"create_conversation",
-			{
-				userId: MOCK_USER_ID,
-				title: "New Travel Plan",
-			},
+			{ userId: MOCK_USER_ID, title: "New Travel Plan" },
 			(response: any) => {
 				console.log("Create conversation response:", response);
 				if (response.success) {
-					// Set the new conversation as active
-					setActiveConversationId(response.conversation.id);
-
 					// Add to conversation history
-					setConversationHistory((prev) => [response.conversation, ...prev]);
+					const newConversation = {
+						id: response.conversationId,
+						title: response.title,
+						lastMessage: "",
+						timestamp: new Date(),
+					};
+
+					setConversationHistory((prev) => [newConversation, ...prev]);
+					setActiveConversationId(response.conversationId);
+					setMessages([]);
 				}
 			}
 		);
@@ -176,35 +224,12 @@ export default function ChatInterface() {
 
 	// Switch to a different conversation
 	const handleSwitchConversation = (conversationId: string) => {
-		if (!socket || !connected) return;
-
 		setTyping(false);
 		setMessages([]);
 		setActiveConversationId(conversationId);
 
-		socket.emit(
-			"switch_conversation",
-			{ userId: MOCK_USER_ID, conversationId },
-			(response: any) => {
-				console.log("Switch conversation response:", response);
-				if (response.success && response.messages) {
-					// Format and set messages from history
-					const formattedMessages = response.messages.map((msg: any) => ({
-						id: msg.id,
-						content: msg.content,
-						isUser: msg.role === "user",
-						timestamp: new Date(msg.timestamp),
-					}));
-
-					setMessages(formattedMessages);
-				}
-			}
-		);
-	};
-
-	// Pre-fill input with suggested messages
-	const setSuggestedInput = (text: string) => {
-		setInput(text);
+		// Fetch conversation messages using HTTP
+		fetchConversationMessages(conversationId);
 	};
 
 	// Get active conversation title
@@ -226,7 +251,7 @@ export default function ChatInterface() {
 				<div className="p-4 border-b border-gray-700 flex items-center justify-between">
 					<h2 className="text-xl font-bold text-blue-400">Conversations</h2>
 					<button
-						onClick={handleNewConversation}
+						onClick={handleCreateConversation}
 						className="p-2 bg-blue-600 rounded-full hover:bg-blue-700 transition-colors"
 						title="New Conversation"
 					>
@@ -339,7 +364,7 @@ export default function ChatInterface() {
 								Create a new chat or select an existing one from the sidebar.
 							</p>
 							<button
-								onClick={handleNewConversation}
+								onClick={handleCreateConversation}
 								className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
 							>
 								New Conversation
@@ -456,7 +481,13 @@ export default function ChatInterface() {
 
 				{/* Input area */}
 				<div className="p-4 bg-gray-800 border-t border-gray-700">
-					<form onSubmit={handleSendMessage} className="flex space-x-2">
+					<form
+						onSubmit={(e) => {
+							e.preventDefault();
+							handleSendMessage();
+						}}
+						className="flex space-x-2"
+					>
 						<input
 							type="text"
 							value={input}
@@ -482,7 +513,7 @@ export default function ChatInterface() {
 							>
 								<path
 									fillRule="evenodd"
-									d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z"
+									d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z"
 									clipRule="evenodd"
 								/>
 							</svg>
