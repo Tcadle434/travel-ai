@@ -30,3 +30,54 @@ export interface ApiResponse<T> {
 	data?: T;
 	error?: string;
 }
+
+// Itinerary interfaces
+export interface ItineraryActivity {
+	time?: string;
+	activity: string;
+	description: string;
+	location?: string;
+}
+
+export interface ItineraryDay {
+	day: number;
+	title: string;
+	activities: ItineraryActivity[];
+}
+
+export interface ItineraryOption {
+	title: string;
+	highlights: string[];
+	description: string;
+	days: ItineraryDay[];
+	estimatedCost?: {
+		amount: number;
+		currency: string;
+		breakdown?: Record<string, number>;
+	};
+	accommodations?: Array<{
+		name: string;
+		description: string;
+		priceRange?: string;
+	}>;
+	transportation?: Array<{
+		type: string;
+		description: string;
+	}>;
+}
+
+export interface ItineraryData {
+	id: string;
+	options: {
+		destination: string;
+		duration: string;
+		travelers: string;
+		options: ItineraryOption[];
+	};
+	timestamp: Date;
+}
+
+export enum AppView {
+	CHAT = "chat",
+	ITINERARY = "itinerary",
+}

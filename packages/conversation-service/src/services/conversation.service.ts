@@ -14,6 +14,65 @@ export class ConversationService {
 	) {}
 
 	/**
+	 * Generate a regular AI response
+	 */
+	private async generateRegularResponse(
+		conversationId: string,
+		userId: string,
+		messages: any[]
+	): Promise<void> {
+		// Generate AI response
+		const responseContent = await this.aiService.generateResponse(messages);
+
+		// Create assistant message
+		const assistantMessage = {
+			id: generateId(),
+			conversationId,
+			userId,
+			role: "assistant",
+			content: responseContent,
+			timestamp: new Date(),
+		};
+
+		// Store assistant message in MongoDB
+		await this.mongoDBService.storeMessage(assistantMessage);
+
+		// Update conversation's last message with AI response
+		await this.mongoDBService.updateConversation(conversationId, {
+			lastMessage: responseContent,
+			updatedAt: new Date(),
+		});
+
+		// Extract travel parameters
+		const extractedParameters = await this.aiService.extractTravelParameters(messages);
+
+		// Store travel parameters if any were extracted
+		if (Object.keys(extractedParameters).length > 0) {
+			// Store in Redis for quick access
+			await this.redisService.storeTravelParameters(conversationId, extractedParameters);
+		}
+
+		// Send the response back to the notification queue
+		await this.rabbitMQService.publishMessage(QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_UPDATED, {
+			id: generateId(),
+			type: "CONVERSATION_UPDATED",
+			payload: {
+				userId,
+				conversationId,
+				assistantMessage: {
+					id: assistantMessage.id,
+					conversationId,
+					content: assistantMessage.content,
+					timestamp: assistantMessage.timestamp,
+				},
+			},
+			timestamp: new Date(),
+		});
+
+		console.log("Regular AI response sent back to notification queue");
+	}
+
+	/**
 	 * Handle a user message and generate a response
 	 */
 	async handleUserMessage(payload: any): Promise<void> {
@@ -58,59 +117,103 @@ export class ConversationService {
 				content: msg.content,
 			}));
 
-			// Generate AI response
-			const responseContent = await this.aiService.generateResponse(formattedHistory);
+			// Check if we should generate itineraries
+			const shouldGenerateItineraries =
+				await this.aiService.shouldGenerateItineraries(formattedHistory);
 
-			// Create assistant message
-			const assistantMessage = {
-				id: generateId(),
-				conversationId,
-				userId,
-				role: "assistant",
-				content: responseContent,
-				timestamp: new Date(),
-			};
+			if (shouldGenerateItineraries) {
+				try {
+					// Generate itinerary options
+					const itineraryOptions =
+						await this.aiService.generateItineraryOptions(formattedHistory);
 
-			// Store assistant message in MongoDB
-			await this.mongoDBService.storeMessage(assistantMessage);
+					// Create confirmation message for the chat
+					const responseContent =
+						"I've prepared three itinerary options for you based on our conversation. You can view and compare them now\!";
 
-			// Update conversation's last message with AI response
-			await this.mongoDBService.updateConversation(conversationId, {
-				lastMessage: responseContent,
-				updatedAt: new Date(),
-			});
+					// Create assistant message
+					const assistantMessage = {
+						id: generateId(),
+						conversationId,
+						userId,
+						role: "assistant",
+						content: responseContent,
+						timestamp: new Date(),
+					};
 
-			// Extract travel parameters
-			const extractedParameters =
-				await this.aiService.extractTravelParameters(formattedHistory);
+					// Store assistant message in MongoDB
+					await this.mongoDBService.storeMessage(assistantMessage);
 
-			// Store travel parameters if any were extracted
-			if (Object.keys(extractedParameters).length > 0) {
-				// Store in Redis for quick access
-				await this.redisService.storeTravelParameters(conversationId, extractedParameters);
+					// Update conversation's last message with AI response
+					await this.mongoDBService.updateConversation(conversationId, {
+						lastMessage: responseContent,
+						updatedAt: new Date(),
+					});
+
+					// Extract travel parameters
+					const extractedParameters =
+						await this.aiService.extractTravelParameters(formattedHistory);
+
+					// Store travel parameters
+					if (Object.keys(extractedParameters).length > 0) {
+						await this.redisService.storeTravelParameters(
+							conversationId,
+							extractedParameters
+						);
+					}
+
+					// Send the response back to the notification queue
+					await this.rabbitMQService.publishMessage(
+						QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_UPDATED,
+						{
+							id: generateId(),
+							type: "CONVERSATION_UPDATED",
+							payload: {
+								userId,
+								conversationId,
+								assistantMessage: {
+									id: assistantMessage.id,
+									conversationId,
+									content: assistantMessage.content,
+									timestamp: assistantMessage.timestamp,
+								},
+							},
+							timestamp: new Date(),
+						}
+					);
+
+					// Send the itinerary options through a separate notification
+					await this.rabbitMQService.publishMessage(
+						QUEUE_CONFIG.ROUTING_KEYS.ITINERARY_GENERATED,
+						{
+							id: generateId(),
+							type: "ITINERARY_GENERATED",
+							payload: {
+								userId,
+								conversationId,
+								itinerary: {
+									id: generateId(),
+									options: itineraryOptions,
+									timestamp: new Date(),
+								},
+							},
+							timestamp: new Date(),
+						}
+					);
+
+					console.log("Itinerary options sent to notification queue");
+				} catch (error) {
+					console.error("Error generating itinerary options:", error);
+
+					// Fall back to normal response if itinerary generation fails
+					await this.generateRegularResponse(conversationId, userId, formattedHistory);
+				}
+			} else {
+				// Generate normal AI response
+				await this.generateRegularResponse(conversationId, userId, formattedHistory);
 			}
 
-			// Send the response back to the notification queue
-			await this.rabbitMQService.publishMessage(
-				QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_UPDATED,
-				{
-					id: generateId(),
-					type: "CONVERSATION_UPDATED",
-					payload: {
-						userId,
-						conversationId,
-						assistantMessage: {
-							id: assistantMessage.id,
-							conversationId,
-							content: assistantMessage.content,
-							timestamp: assistantMessage.timestamp,
-						},
-					},
-					timestamp: new Date(),
-				}
-			);
-
-			console.log("AI response sent back to notification queue");
+			console.log("AI response processing completed");
 		} catch (error) {
 			console.error(`Error handling message from user ${userId}`, error);
 		}
