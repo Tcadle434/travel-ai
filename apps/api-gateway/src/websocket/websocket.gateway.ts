@@ -1,4 +1,3 @@
-// apps/api-gateway/src/websocket/websocket.gateway.ts
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -142,7 +141,6 @@ export class WebsocketGateway
       // In a production system, we might use a request-response pattern here
       await new Promise((resolve) => setTimeout(resolve, 300));
 
-      // Invalidate user conversations cache
       await this.cacheService.invalidateUserConversationsCache(userId);
 
       return {
@@ -166,6 +164,14 @@ export class WebsocketGateway
       const { userId, conversationId, message } = data;
       const messageId = generateId();
 
+      // Check if this message might be requesting an itinerary
+      const isItineraryRequest = this.isItineraryRequest(message);
+
+      // Modify the message to request multiple itineraries if it seems like an itinerary request
+      const enhancedMessage = isItineraryRequest
+        ? this.enhanceMessageForMultipleItineraries(message)
+        : message;
+
       // Publish to queue
       await this.rabbitmqService.publishMessage(
         QUEUE_CONFIG.ROUTING_KEYS.CONVERSATION_UPDATED,
@@ -177,18 +183,16 @@ export class WebsocketGateway
             userId,
             message: {
               id: messageId,
-              content: message,
+              content: enhancedMessage,
               timestamp: new Date(),
             },
+            generateMultipleItineraries: isItineraryRequest,
           },
           timestamp: new Date(),
         },
       );
 
-      // Invalidate conversation cache
       await this.cacheService.invalidateConversationCache(conversationId);
-
-      // Invalidate user conversations cache
       await this.cacheService.invalidateUserConversationsCache(userId);
 
       return {
@@ -294,11 +298,59 @@ export class WebsocketGateway
           switch (message.type) {
             case 'CONVERSATION_UPDATED':
               if (payload.userId && payload.assistantMessage) {
-                await this.sendToUser(
-                  payload.userId,
-                  'message_received',
-                  payload.assistantMessage,
-                );
+                // Check if this is a large message that might be an itinerary
+                const content = payload.assistantMessage.content;
+                const isLargeMessage = content && content.length > 4000;
+                const containsItineraryMarkers =
+                  content &&
+                  (content.includes('# Itinerary 1') ||
+                    content.includes('Itinerary 1:'));
+
+                if (isLargeMessage && containsItineraryMarkers) {
+                  this.logger.log(
+                    'Large itinerary message detected, sending in chunks',
+                  );
+
+                  // First, send a notification that we're processing itineraries
+                  await this.sendToUser(payload.userId, 'message_received', {
+                    id: `${payload.assistantMessage.id}-part-0`,
+                    content:
+                      "I'm preparing your itineraries. This might take a moment...",
+                    timestamp: new Date(),
+                  });
+
+                  // Split the content into chunks to ensure complete delivery
+                  const chunks = this.splitContentIntoChunks(content);
+
+                  // Send each chunk as a separate message
+                  for (let i = 0; i < chunks.length; i++) {
+                    await this.sendToUser(payload.userId, 'message_received', {
+                      id: `${payload.assistantMessage.id}-part-${i + 1}`,
+                      content: chunks[i],
+                      timestamp: new Date(),
+                      isItineraryPart: true,
+                      partNumber: i + 1,
+                      totalParts: chunks.length,
+                    });
+
+                    // Add a small delay between chunks to ensure order
+                    await new Promise((resolve) => setTimeout(resolve, 300));
+                  }
+
+                  // Send a final complete message with all content for processing
+                  await this.sendToUser(payload.userId, 'itinerary_complete', {
+                    id: `${payload.assistantMessage.id}-complete`,
+                    content: content,
+                    timestamp: new Date(),
+                  });
+                } else {
+                  // Regular message, send as is
+                  await this.sendToUser(
+                    payload.userId,
+                    'message_received',
+                    payload.assistantMessage,
+                  );
+                }
               }
               break;
 
@@ -321,5 +373,170 @@ export class WebsocketGateway
     } catch (error) {
       this.logger.error('Failed to consume notification messages', error);
     }
+  }
+
+  // Helper method to split content into manageable chunks
+  private splitContentIntoChunks(content: string): string[] {
+    // If content is small enough, return as is
+    if (content.length <= 8000) {
+      return [content];
+    }
+
+    const chunks: string[] = [];
+
+    // Try to split at logical boundaries like itinerary sections
+    const itineraryMarkers = [
+      '# Itinerary 1',
+      '# Itinerary 2',
+      '# Itinerary 3',
+      'Itinerary 1:',
+      'Itinerary 2:',
+      'Itinerary 3:',
+    ];
+
+    let lastIndex = 0;
+
+    // Find each itinerary section
+    for (const marker of itineraryMarkers) {
+      const index = content.indexOf(marker, lastIndex);
+
+      if (index !== -1 && index > lastIndex) {
+        // Add the content up to this marker
+        if (index > lastIndex) {
+          chunks.push(content.substring(lastIndex, index));
+        }
+
+        lastIndex = index;
+      }
+    }
+
+    // Add the remaining content
+    if (lastIndex < content.length) {
+      chunks.push(content.substring(lastIndex));
+    }
+
+    // If we couldn't split by markers or only got one chunk, split by size
+    if (chunks.length <= 1) {
+      chunks.length = 0; // Clear the array
+
+      // Split into chunks of approximately 6000 characters
+      // Try to split at paragraph boundaries
+      const paragraphs = content.split('\n\n');
+      let currentChunk = '';
+
+      for (const paragraph of paragraphs) {
+        if (currentChunk.length + paragraph.length + 2 > 6000) {
+          chunks.push(currentChunk);
+          currentChunk = paragraph + '\n\n';
+        } else {
+          currentChunk += paragraph + '\n\n';
+        }
+      }
+
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+      }
+    }
+
+    return chunks;
+  }
+
+  // Helper method to check if a message is likely requesting an itinerary
+  private isItineraryRequest(message: string): boolean {
+    const itineraryKeywords = [
+      'itinerary',
+      'travel plan',
+      'trip plan',
+      'vacation',
+      'holiday',
+      'visit',
+      'tour',
+      'journey',
+      'travel to',
+      'traveling to',
+      'travelling to',
+      'plan a trip',
+      'plan my trip',
+      'plan my vacation',
+      'plan my holiday',
+    ];
+
+    const lowercaseMessage = message.toLowerCase();
+    return itineraryKeywords.some((keyword) =>
+      lowercaseMessage.includes(keyword),
+    );
+  }
+
+  // Helper method to enhance a message to request multiple itineraries
+  private enhanceMessageForMultipleItineraries(message: string): string {
+    // Check if the message already explicitly asks for multiple options
+    const alreadyAsksForMultiple =
+      /\b(multiple|several|different|various|3|three)\b.*\b(options|itineraries|plans|suggestions|alternatives)\b/i.test(
+        message,
+      );
+
+    if (alreadyAsksForMultiple) {
+      // Even if they ask for multiple, we still need to enforce our format
+      return `${message}
+
+IMPORTANT: You MUST respond with 3 distinct, highly detailed travel itineraries. You MUST follow this EXACT format:
+
+# Itinerary 1: [TITLE]
+[Brief overview/introduction - 2-3 sentences]
+
+## Day-by-Day Plan
+[Detailed day-by-day breakdown with specific locations, activities, and timing]
+
+## Accommodations
+[Specific hotel recommendations with approximate pricing]
+
+## Transportation
+[Details on getting around and between locations]
+
+## Estimated Budget
+[Breakdown of costs for accommodations, food, activities, and transportation]
+
+## Highlights
+[Key attractions and experiences]
+
+# Itinerary 2: [TITLE]
+[Follow the same format as above but with different locations/activities/accommodations]
+
+# Itinerary 3: [TITLE]
+[Follow the same format as above but with different locations/activities/accommodations]
+
+Each itinerary MUST be completely unique from the others, offering different experiences while still meeting the requirements in the original request. DO NOT cut off your response - you MUST complete all 3 itineraries in full detail.`;
+    }
+
+    // Add instruction to generate multiple itineraries with more detailed requirements
+    return `${message}
+
+IMPORTANT: You MUST respond with 3 distinct, highly detailed travel itineraries. You MUST follow this EXACT format:
+
+# Itinerary 1: [TITLE]
+[Brief overview/introduction - 2-3 sentences]
+
+## Day-by-Day Plan
+[Detailed day-by-day breakdown with specific locations, activities, and timing]
+
+## Accommodations
+[Specific hotel recommendations with approximate pricing]
+
+## Transportation
+[Details on getting around and between locations]
+
+## Estimated Budget
+[Breakdown of costs for accommodations, food, activities, and transportation]
+
+## Highlights
+[Key attractions and experiences]
+
+# Itinerary 2: [TITLE]
+[Follow the same format as above but with different locations/activities/accommodations]
+
+# Itinerary 3: [TITLE]
+[Follow the same format as above but with different locations/activities/accommodations]
+
+Each itinerary MUST be completely unique from the others, offering different experiences while still meeting the requirements in the original request. DO NOT cut off your response - you MUST complete all 3 itineraries in full detail.`;
   }
 }

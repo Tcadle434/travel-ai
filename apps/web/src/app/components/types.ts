@@ -30,3 +30,27 @@ export interface ApiResponse<T> {
 	data?: T;
 	error?: string;
 }
+
+// New interfaces for itineraries
+export interface ItineraryHighlight {
+	type: "location" | "budget" | "hotel" | "activity" | "transportation" | "restaurant" | "other";
+	title: string;
+	description: string;
+	icon?: string;
+}
+
+export interface Itinerary {
+	id: string;
+	title: string;
+	description: string;
+	days: number;
+	highlights: ItineraryHighlight[];
+	fullContent: string;
+	createdAt: Date;
+}
+
+export interface ItinerariesState {
+	itineraries: Itinerary[];
+	activeItineraryId: string | null;
+	showItinerariesPage: boolean;
+}

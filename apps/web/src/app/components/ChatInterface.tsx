@@ -2,13 +2,16 @@
 
 import { useState, useEffect } from "react";
 import { io, Socket } from "socket.io-client";
+import { useRouter } from "next/navigation";
 import ChatSidebar from "./ChatSidebar";
 import MessageList from "./MessageList";
 import MessageInput from "./MessageInput";
 import WelcomeScreen from "./WelcomeScreen";
 import ErrorMessage from "./ErrorMessage";
 import ChatHeader from "./ChatHeader";
-import { Message, ApiMessage, ConversationHistory, ApiResponse } from "./types";
+import { ApiMessage, ConversationHistory, ApiResponse, Itinerary } from "./types";
+import { Message } from "../../types/message";
+import { parseItinerariesFromContent } from "../utils/itineraryParser";
 
 // Mock user ID for demo purposes
 const MOCK_USER_ID = "user-" + Math.random().toString(36).substring(2, 9);
@@ -17,6 +20,7 @@ const MOCK_USER_ID = "user-" + Math.random().toString(36).substring(2, 9);
 const API_BASE_URL = "http://localhost:4000/api";
 
 export default function ChatInterface() {
+	const router = useRouter();
 	const [socket, setSocket] = useState<Socket | null>(null);
 	const [connected, setConnected] = useState(false);
 	const [messages, setMessages] = useState<Message[]>([]);
@@ -26,9 +30,11 @@ export default function ChatInterface() {
 	const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [receivedMessageIds, setReceivedMessageIds] = useState<Set<string>>(new Set());
+	const [itineraries, setItineraries] = useState<Itinerary[]>([]);
 
 	// Initialize socket connection
 	useEffect(() => {
+		// Initialize socket connection even without an active conversation
 		const newSocket = io("http://localhost:4000", {
 			transports: ["websocket", "polling"],
 			autoConnect: true,
@@ -36,18 +42,15 @@ export default function ChatInterface() {
 			reconnectionAttempts: 5,
 		});
 
+		// Set up event listeners
 		newSocket.on("connect", () => {
 			console.log("Socket connected");
 			setConnected(true);
-			setError(null);
 
-			// Identify the user to the server
-			newSocket.emit("identify", { userId: MOCK_USER_ID }, (response: any) => {
-				console.log("Identify response:", response);
-				if (!response.success) {
-					setError("Failed to identify user");
-				}
-			});
+			// Join the conversation room if we have an active conversation
+			if (activeConversationId) {
+				newSocket.emit("join_conversation", { conversationId: activeConversationId });
+			}
 		});
 
 		newSocket.on("disconnect", () => {
@@ -55,49 +58,88 @@ export default function ChatInterface() {
 			setConnected(false);
 		});
 
-		// Add this to listen for all events for debugging
-		newSocket.onAny((event, ...args) => {
-			console.log(`Received event: ${event}`, args);
-		});
+		newSocket.on("message", (message: Message) => {
+			console.log("Received message:", message);
 
-		newSocket.on("message_received", (data: any) => {
-			console.log("Message received:", data);
+			// Handle chunked messages
+			if (message.metadata?.isChunk) {
+				console.log(
+					`Received chunk ${(message.metadata.chunkIndex || 0) + 1}/${message.metadata.totalChunks || 1}`
+				);
 
-			// Check for duplicate messages
-			if (data.id && receivedMessageIds.has(data.id)) {
-				console.warn(`Duplicate message received and ignored: ${data.id}`);
-				return;
+				// Add the chunk to the messages
+				setMessages((prev) => {
+					// Check if we already have this chunk (avoid duplicates)
+					const existingChunk = prev.find(
+						(m) =>
+							m.metadata?.isChunk &&
+							m.metadata.chunkIndex === message.metadata?.chunkIndex
+					);
+
+					if (existingChunk) {
+						return prev;
+					}
+
+					return [...prev, message];
+				});
+			} else {
+				// Regular message handling
+				setMessages((prev) => {
+					// Replace temporary message if it exists
+					const tempIndex = prev.findIndex((m) => m.id === "temp-" + Date.now());
+					if (tempIndex !== -1) {
+						const newMessages = [...prev];
+						newMessages[tempIndex] = message;
+						return newMessages;
+					}
+					return [...prev, message];
+				});
 			}
 
-			// Add message ID to the set of received messages
-			if (data.id) {
-				setReceivedMessageIds((prev) => new Set(prev).add(data.id));
-			}
-
-			setMessages((prev) => [
-				...prev,
-				{
-					id: data.id,
-					content: data.content,
-					isUser: false,
-					timestamp: new Date(data.timestamp),
-				},
-			]);
 			setTyping(false);
 		});
 
-		// Add error handling
-		newSocket.on("connect_error", (error) => {
-			console.error("Connection error:", error);
-			setError("Failed to connect to server");
+		// Handle itineraries complete notification
+		newSocket.on("itineraries_complete", (data: any) => {
+			console.log("Itineraries complete:", data);
+
+			// Combine all message chunks to get the full content
+			const fullContent = combineMessageChunks();
+
+			// Save itineraries to localStorage
+			if (fullContent) {
+				localStorage.setItem("itineraries", fullContent);
+
+				// Redirect to itineraries page
+				window.location.href = "/itineraries";
+			}
 		});
 
 		setSocket(newSocket);
 
+		// Clean up on unmount
 		return () => {
 			newSocket.disconnect();
 		};
-	}, [receivedMessageIds]);
+	}, [activeConversationId]); // Keep the dependency array, but we'll connect regardless
+
+	// Helper function to combine message chunks
+	const combineMessageChunks = () => {
+		// Get all AI message chunks in order
+		const chunks = messages
+			.filter((m) => !m.isUser && m.metadata?.isChunk)
+			.sort((a, b) => (a.metadata?.chunkIndex || 0) - (b.metadata?.chunkIndex || 0));
+
+		if (chunks.length === 0) {
+			// If no chunks, get the last AI message
+			const lastAiMessage = [...messages].filter((m) => !m.isUser).pop();
+
+			return lastAiMessage?.content || "";
+		}
+
+		// Combine chunks
+		return chunks.map((chunk) => chunk.content).join("");
+	};
 
 	// Reset received message IDs when switching conversations
 	useEffect(() => {
@@ -172,6 +214,22 @@ export default function ChatInterface() {
 				);
 
 				setMessages(formattedMessages);
+
+				// Check if any of the messages contain itinerary information
+				const allContent = formattedMessages
+					.filter((msg) => !msg.isUser)
+					.map((msg) => msg.content)
+					.join("\n\n");
+
+				const extractedItineraries = parseItinerariesFromContent(allContent);
+				if (extractedItineraries.length > 0) {
+					setItineraries(extractedItineraries);
+
+					// Save to localStorage for persistence
+					if (typeof window !== "undefined") {
+						localStorage.setItem("itineraries", JSON.stringify(extractedItineraries));
+					}
+				}
 			} else if (data.error) {
 				setError(data.error);
 				console.error("Failed to fetch conversation messages:", data.error);
@@ -211,10 +269,19 @@ export default function ChatInterface() {
 		setTyping(true);
 		setError(null);
 
+		// Check if this message might be a travel planning request
+		const isTravelRequest = detectTravelRequest(message);
+		console.log(`Message travel request detection: ${isTravelRequest ? "YES" : "NO"}`);
+
 		// Send message to server
 		socket.emit(
 			"send_message",
-			{ userId: MOCK_USER_ID, conversationId: activeConversationId, message },
+			{
+				userId: MOCK_USER_ID,
+				conversationId: activeConversationId,
+				message,
+				isTravelRequest, // Pass this flag to the server
+			},
 			(response: any) => {
 				console.log("Send message response:", response);
 				if (!response.success) {
@@ -225,6 +292,52 @@ export default function ChatInterface() {
 		);
 	};
 
+	// Helper function to detect if a message is likely a travel planning request
+	const detectTravelRequest = (message: string): boolean => {
+		const travelKeywords = [
+			"travel",
+			"trip",
+			"vacation",
+			"visit",
+			"go to",
+			"flight",
+			"hotel",
+			"beach",
+			"mountain",
+			"city",
+			"tour",
+			"itinerary",
+			"plan",
+			"holiday",
+			"destination",
+			"resort",
+			"cruise",
+			"adventure",
+			"sightseeing",
+			"where should i go",
+			"where to go",
+			"where to visit",
+		];
+
+		const lowercaseMessage = message.toLowerCase();
+
+		// Check for travel keywords
+		const hasTravelKeyword = travelKeywords.some((keyword) =>
+			lowercaseMessage.includes(keyword)
+		);
+
+		// Check for question patterns about travel
+		const isTravelQuestion =
+			/\b(where|what|how|recommend|suggest)\b.*\b(go|visit|travel|vacation|trip|destination)\b/i.test(
+				lowercaseMessage
+			);
+
+		// Check for location mentions
+		const hasLocation = /\b(in|to)\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)?\b/.test(message);
+
+		return hasTravelKeyword || isTravelQuestion || hasLocation;
+	};
+
 	// Handle suggested input
 	const setSuggestedInput = (text: string) => {
 		if (!socket || !connected || !activeConversationId) return;
@@ -233,9 +346,15 @@ export default function ChatInterface() {
 
 	// Create a new conversation
 	const handleCreateConversation = () => {
-		if (!socket || !connected) return;
+		if (!socket || !connected) {
+			console.error("Cannot create conversation: Socket not connected");
+			setError("Cannot create conversation: Not connected to server");
+			return;
+		}
 
+		console.log("Creating new conversation...");
 		setError(null);
+
 		socket.emit(
 			"create_conversation",
 			{ userId: MOCK_USER_ID, title: "New Travel Plan" },
@@ -279,6 +398,13 @@ export default function ChatInterface() {
 		return activeConv ? activeConv.title : "Travel Assistant";
 	};
 
+	// View itineraries
+	const handleViewItineraries = () => {
+		if (itineraries.length > 0) {
+			router.push("/itineraries");
+		}
+	};
+
 	return (
 		<div className="flex h-screen bg-gray-900 text-gray-100">
 			{/* Sidebar */}
@@ -298,6 +424,8 @@ export default function ChatInterface() {
 					title={getActiveConversationTitle()}
 					conversationId={activeConversationId}
 					onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+					hasItineraries={itineraries.length > 0}
+					onViewItineraries={handleViewItineraries}
 				/>
 
 				{/* Messages area */}

@@ -4,9 +4,17 @@ interface ChatHeaderProps {
 	title: string;
 	conversationId: string | null;
 	onToggleSidebar: () => void;
+	hasItineraries?: boolean;
+	onViewItineraries?: () => void;
 }
 
-const ChatHeader: React.FC<ChatHeaderProps> = ({ title, conversationId, onToggleSidebar }) => {
+const ChatHeader: React.FC<ChatHeaderProps> = ({
+	title,
+	conversationId,
+	onToggleSidebar,
+	hasItineraries = false,
+	onViewItineraries,
+}) => {
 	return (
 		<div className="bg-gray-800 p-4 flex items-center justify-between border-b border-gray-700">
 			<div className="flex items-center">
@@ -31,9 +39,22 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({ title, conversationId, onToggle
 				</button>
 				<h2 className="text-xl font-bold">{title}</h2>
 			</div>
-			{conversationId && (
-				<div className="text-sm text-gray-400">ID: {conversationId.substring(0, 8)}...</div>
-			)}
+			<div className="flex items-center">
+				{hasItineraries && onViewItineraries && (
+					<button
+						onClick={onViewItineraries}
+						className="mr-4 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors flex items-center"
+					>
+						<span className="mr-1">✈️</span>
+						View Itineraries
+					</button>
+				)}
+				{conversationId && (
+					<div className="text-sm text-gray-400">
+						ID: {conversationId.substring(0, 8)}...
+					</div>
+				)}
+			</div>
 		</div>
 	);
 };
